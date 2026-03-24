@@ -22,6 +22,7 @@ PKG-INFO
 lerobot
 visualize_result/
 data_to_use/
+*.egg-info/
 
 # Local dev files
 CLAUDE.md
