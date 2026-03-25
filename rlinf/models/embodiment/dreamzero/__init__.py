@@ -18,9 +18,7 @@ import os
 
 from omegaconf import DictConfig
 
-from rlinf.models.embodiment.dreamzero.dreamzero_policy import (
-    DreamZeroForRLActionPrediction,
-)
+from rlinf.models.embodiment.dreamzero.dreamzero_policy import DreamZeroPolicy
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
@@ -42,19 +40,19 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             "Please provide a valid checkpoint directory."
         )
 
-    embodiment_tag = cfg.get("embodiment_tag", "oxe_droid")
-    num_action_chunks = cfg.get("num_action_chunks", 24)
-    action_dim = cfg.get("action_dim", 8)
-    add_value_head = cfg.get("add_value_head", False)
-    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    tokenizer_path = cfg.get("tokenizer_path", "google/umt5-xxl")
+    max_seq_len = cfg.get("max_seq_len", 512)
+    cpu_init = cfg.get("cpu_init", True)
+    device = "cpu" if cpu_init else (
+        "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    )
 
-    model = DreamZeroForRLActionPrediction(
+    model = DreamZeroPolicy(
         model_path=model_path,
-        embodiment_tag=embodiment_tag,
         device=device,
-        num_action_chunks=num_action_chunks,
-        action_dim=action_dim,
-        add_value_head=add_value_head,
+        tokenizer_path=tokenizer_path,
+        max_seq_len=max_seq_len,
+        cpu_init=cpu_init,
     )
 
     return model

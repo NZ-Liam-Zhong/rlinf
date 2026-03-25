@@ -10,6 +10,7 @@ import mediapy
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn as nn
 import dataclasses
 import logging
 from tianshou.data import Batch
@@ -17,7 +18,12 @@ from omegaconf import OmegaConf, DictConfig
 from groot.vla.data.schema import DatasetMetadata
 from groot.vla.data.transform import ComposedModalityTransform
 import os
-from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+
+
+logger = logging.getLogger(__name__)
+
+
 # Ensure groot is importable (dreamzero repo structure)
 def _ensure_groot_importable():
     if "groot" in sys.modules:
@@ -27,7 +33,7 @@ def _ensure_groot_importable():
         sys.path.insert(0, str(dreamzero_root))
 
 
-class DreamZeroPolicy(BasePolicy):
+class DreamZeroPolicy(nn.Module, BasePolicy):
     """Lightweight DreamZero action model: IdentityBackbone + WANPolicyHead.
 
     - predict_action_batch: for eval (inference)
@@ -42,20 +48,33 @@ class DreamZeroPolicy(BasePolicy):
         force_identity_backbone: bool = True,
         tokenizer_path: str = "google/umt5-xxl",
         max_seq_len: int = 512,
+        cpu_init: bool = False,
     ):
+        nn.Module.__init__(self)
         _ensure_groot_importable()
 
         from groot.vla.model.dreamzero.base_vla import VLA, VLAConfig
 
         self.model_path = Path(model_path)
-        self.device = torch.device(device if isinstance(device, str) else f"cuda:{device}")
+        self.device = torch.device("cpu") if cpu_init else torch.device(
+            device if isinstance(device, str) else f"cuda:{device}"
+        )
         self.eval_bf16 = eval_bf16
+        self.tokenizer_path = tokenizer_path
+        self.max_seq_len = max_seq_len
         self._tokenizer = None
         exp_cfg_dir = self.model_path / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
-        train_cfg = OmegaConf.load(train_cfg_path)
-        self.train_cfg = train_cfg
-        self.eval_bf16 = self.train_cfg.get("eval_bf16", False)
+        self.train_cfg = OmegaConf.create({})
+        if train_cfg_path.exists():
+            self.train_cfg = OmegaConf.load(train_cfg_path)
+            self.eval_bf16 = self.train_cfg.get("eval_bf16", self.eval_bf16)
+        else:
+            logger.info(
+                "DreamZero checkpoint has no experiment_cfg/conf.yaml: %s. "
+                "SFT path is still supported; eval transform-dependent APIs are disabled.",
+                train_cfg_path,
+            )
 
         # Load config
         config_path = self.model_path / "config.json"
@@ -65,11 +84,17 @@ class DreamZeroPolicy(BasePolicy):
         with open(config_path) as f:
             config_dict = json.load(f)
 
+        # Normalize target paths for checkpoints saved with old dreamvla module names.
+        self._normalize_config_targets(config_dict)
+
         # Force IdentityBackbone for lightweight structure
         if force_identity_backbone:
             config_dict["backbone_cfg"] = {
                 "_target_": "groot.vla.model.dreamzero.backbone.identity.IdentityBackbone"
             }
+
+        # Patch sub-module pretrained paths to local Wan checkpoint if available
+        self._patch_pretrained_paths(config_dict)
 
         config = VLAConfig(**config_dict)
 
@@ -82,17 +107,27 @@ class DreamZeroPolicy(BasePolicy):
             self.model = self._load_model_with_config(str(self.model_path), config)
         else:
             self.model = VLA.from_pretrained(str(self.model_path))
-        #self.model.eval()
 
         if eval_bf16:
             self.model = self.model.to(dtype=torch.bfloat16)
-        self.model = self.model.to(device=self.device)
+        if not cpu_init:
+            self.model = self.model.to(device=self.device)
 
-        if hasattr(self.model, "post_initialize"):
+        self._fix_scalar_parameters()
+
+        self._no_split_modules = [
+            "WanAttentionBlock",
+            "GanAttentionBlock",
+            "CausalWanAttentionBlock",
+            "DiTBlock",
+        ]
+
+        should_post_initialize = train_cfg_path.exists()
+        if hasattr(self.model, "post_initialize") and should_post_initialize:
             try:
                 self.model.post_initialize()
             except Exception as e:
-                print(f"post_initialize skipped: {e}")
+                logger.warning("post_initialize skipped: %s", e)
 
         self.action_horizon = self.model.action_horizon
         self.action_dim = self.model.action_dim
@@ -114,23 +149,51 @@ class DreamZeroPolicy(BasePolicy):
         # We have an assumption: one policy is only for rolling out one type of env, i.e., one embodiment_tag
         # metadata_versions = train_cfg.metadata_versions
         # metadata = get_metadata(self.embodiment_tag, metadata_versions[self.embodiment_tag.value])
+        self.eval_transform = None
         metadata_path = exp_cfg_dir / "metadata.json"
-        with open(metadata_path, "r") as f:
-            metadatas = json.load(f)
-        metadata = DatasetMetadata.model_validate(metadatas["oxe_droid"])
+        if (
+            train_cfg_path.exists()
+            and metadata_path.exists()
+            and "transforms" in self.train_cfg
+            and "oxe_droid" in self.train_cfg.transforms
+        ):
+            with open(metadata_path, "r") as f:
+                metadatas = json.load(f)
+            if "oxe_droid" in metadatas:
+                metadata = DatasetMetadata.model_validate(metadatas["oxe_droid"])
+                eval_transform = instantiate(self.train_cfg.transforms["oxe_droid"])
+                assert isinstance(eval_transform, ComposedModalityTransform), f"{eval_transform=}"
+                eval_transform.set_metadata(metadata)
+                eval_transform.eval()
+                self.eval_transform = eval_transform
 
-        # 2.2. Get the eval transforms
+    def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
+        if forward_type == ForwardType.DEFAULT:
+            return self.default_forward(**kwargs)
+        raise NotImplementedError(f"forward_type {forward_type} is not supported.")
 
-        eval_transform_cfg = train_cfg.transforms["oxe_droid"]
+    def default_forward(self, data=None, **kwargs):
+        if data is None:
+            data = kwargs.get("data")
+        if data is None:
+            raise ValueError("DreamZero default_forward requires `data`.")
+        return self.sft_forward(data=data)
 
-        eval_transform = instantiate(train_cfg.transforms["oxe_droid"])
-        assert isinstance(eval_transform, ComposedModalityTransform), f"{eval_transform=}"
-        eval_transform.set_metadata(metadata)
-        eval_transform.eval()
-        self.eval_transform = eval_transform
+    def sft_forward(self, data, **kwargs):
+        inputs = data
+        if not isinstance(inputs, dict):
+            raise TypeError("DreamZero sft_forward expects a dict input batch.")
+        outputs = self.model(inputs)
+        if "loss" not in outputs:
+            raise KeyError("DreamZero model output does not contain `loss`.")
+        return outputs["loss"]
 
     def apply(self, batch: Batch, **kwargs) -> Batch:
         """Normalize inputs"""
+        if self.eval_transform is None:
+            raise RuntimeError("DreamZero eval transform is unavailable for this checkpoint.")
         obs = batch.obs
 
         normalized_input = self.eval_transform(obs)
@@ -139,6 +202,8 @@ class DreamZeroPolicy(BasePolicy):
     
     def unapply(self, batch: Batch, obs: dict = None, **kwargs):
         """Unnormalize actions and convert relative actions to absolute if needed"""
+        if self.eval_transform is None:
+            raise RuntimeError("DreamZero eval transform is unavailable for this checkpoint.")
         unnormalized_action = self.eval_transform.unapply(
             dict(action=batch.normalized_action.cpu())
         )
@@ -147,7 +212,6 @@ class DreamZeroPolicy(BasePolicy):
         relative_action = self.train_cfg.get('relative_action', False)
         relative_action_per_horizon = self.train_cfg.get('relative_action_per_horizon', False)
         relative_action_keys = self.train_cfg.get('relative_action_keys', [])
-        print("relative_action_per_horizon", relative_action_per_horizon)
         if (relative_action or relative_action_per_horizon) and relative_action_keys and obs is not None:
             for key in relative_action_keys:
                 action_key = f"action.{key}"
@@ -202,11 +266,83 @@ class DreamZeroPolicy(BasePolicy):
                     last_state = np.expand_dims(last_state, axis=-2)  # Add horizon dimension
                 
                 # Add state to relative action to get absolute action
-                print("last_state", last_state.shape, "unnormalized_action[action_key]", unnormalized_action[action_key].shape)
                 unnormalized_action[action_key] = unnormalized_action[action_key] + last_state
         
         batch.act = unnormalized_action
         return batch
+
+    def _patch_pretrained_paths(self, config_dict: dict) -> None:
+        """Fill in local pretrained paths for sub-modules so VLA() never downloads."""
+        wan_dir = self.model_path.parent / "Wan2.1-I2V-14B-480P"
+        if not wan_dir.is_dir():
+            return
+
+        path_map = {
+            "text_encoder_pretrained_path": wan_dir / "models_t5_umt5-xxl-enc-bf16.pth",
+            "image_encoder_pretrained_path": wan_dir / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            "vae_pretrained_path": wan_dir / "Wan2.1_VAE.pth",
+        }
+
+        ah_cfg = config_dict.get("action_head_cfg", {}).get("config", {})
+        if not isinstance(ah_cfg, dict):
+            return
+
+        for sub_key in ("text_encoder_cfg", "image_encoder_cfg", "vae_cfg"):
+            sub_cfg = ah_cfg.get(sub_key)
+            if not isinstance(sub_cfg, dict):
+                continue
+            for path_key, local_path in path_map.items():
+                if path_key in sub_cfg and local_path.exists():
+                    sub_cfg[path_key] = str(local_path)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing on the DiT backbone."""
+        from torch.utils.checkpoint import checkpoint
+
+        for module in self.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+            if hasattr(module, "_gradient_checkpointing_func"):
+                module._gradient_checkpointing_func = checkpoint
+
+    def gradient_checkpointing_disable(self):
+        for module in self.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = False
+
+    def _fix_scalar_parameters(self) -> None:
+        """Reshape scalar (0-D) parameters to 1-D so FSDP can manage them."""
+        for name, param in list(self.named_parameters()):
+            if param.dim() == 0:
+                parts = name.split(".")
+                parent = self
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                new_param = torch.nn.Parameter(
+                    param.data.unsqueeze(0), requires_grad=param.requires_grad
+                )
+                setattr(parent, parts[-1], new_param)
+                logger.info("Reshaped scalar param %s to 1-D for FSDP", name)
+
+    def _normalize_config_targets(self, config_dict: dict) -> None:
+        """Rewrite legacy target paths so Hydra can instantiate modules in this repo."""
+        def _rewrite(value):
+            if isinstance(value, str):
+                value = value.replace("groot.vla.model.dreamvla.", "groot.vla.model.dreamzero.")
+                value = value.replace(
+                    "wan_flow_matching_action_tf_efficient_weighted",
+                    "wan_flow_matching_action_tf",
+                )
+                return value
+            if isinstance(value, dict):
+                return {k: _rewrite(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_rewrite(v) for v in value]
+            return value
+
+        rewritten = _rewrite(config_dict)
+        config_dict.clear()
+        config_dict.update(rewritten)
 
     def _load_model_with_config(self, model_path: str, config) -> "VLA":
         """Load VLA with custom config (e.g. IdentityBackbone) and weights."""
@@ -230,8 +366,6 @@ class DreamZeroPolicy(BasePolicy):
             raise FileNotFoundError(f"No weights at {model_path}")
 
         model = VLA(config)
-        if hasattr(model, "post_initialize"):
-            model.post_initialize()
 
         has_base_layer = any(".base_layer." in k for k in state_dict)
         if has_base_layer:
@@ -409,8 +543,6 @@ class DreamZeroPolicy(BasePolicy):
         output:
         actions: np.ndarray [B, num_action_chunks, 8]  # 7 joint + 1 gripper
         result: dict  # compatible with rollout interface"""
-        print("================= env_obs ==================")
-        print(env_obs)
         converted_obs = self._convert_observation(env_obs)
         batch = Batch(obs=converted_obs)
         # relative action unnormalization needs to preserve original obs
@@ -493,16 +625,16 @@ def squeeze_dict_values(data: dict[str, Any]) -> dict[str, Any]:
 def get_model(cfg: DictConfig, torch_dtype=None):
     """Load DreamZero policy from checkpoint.
     """
-    model_path = cfg.actor.model.get("model_path")
+    model_cfg = cfg.actor.model if hasattr(cfg, "actor") and hasattr(cfg.actor, "model") else cfg
+    model_path = model_cfg.get("model_path")
     if not model_path or not os.path.exists(model_path):
         raise FileNotFoundError(
             f"DreamZero model_path does not exist: {model_path}. "
             "Please provide a valid checkpoint directory."
         )
 
-    tokenizer_path = cfg.actor.model.get("tokenizer_path", "google/umt5-xxl")
-    print("tokenizer_path", tokenizer_path)
-    max_seq_len = cfg.actor.model.get("max_seq_len", 512)
+    tokenizer_path = model_cfg.get("tokenizer_path", "google/umt5-xxl")
+    max_seq_len = model_cfg.get("max_seq_len", 512)
     device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
 
     model = DreamZeroPolicy(

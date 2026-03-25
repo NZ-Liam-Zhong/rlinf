@@ -137,6 +137,19 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
     resnet_policy = functools.partial(_module_wrap_policy, module_classes={ResNet10})
     policies.append(resnet_policy)
 
+    if SupportedModel(model_type) == SupportedModel.DREAMZERO:
+        from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy as _lambda_policy
+
+        def _dreamzero_wrap_fn(mod):
+            cls_name = type(mod).__name__
+            if cls_name in ("WanAttentionBlock", "GanAttentionBlock",
+                            "CausalWanAttentionBlock", "DiTBlock"):
+                return True
+            return False
+
+        dreamzero_policy = functools.partial(_lambda_policy, lambda_fn=_dreamzero_wrap_fn)
+        policies.append(dreamzero_policy)
+
     # Add vision transformer policies for OpenVLA models
     if SupportedModel(model_type) in [
         SupportedModel.OPENVLA,
@@ -210,18 +223,20 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception(
-                    "Could not find the transformer layer class to wrap in the model."
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Could not find transformer layer class %s in model, skipping.",
+                    layer_class,
                 )
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        llm_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            # Transformer layer class to wrap
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(llm_wrap_policy)
+        if transformer_cls_to_wrap:
+            llm_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(llm_wrap_policy)
 
     if hasattr(module, "_no_split_names"):
         no_split_names = getattr(module, "_no_split_names", None)
