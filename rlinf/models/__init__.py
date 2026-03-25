@@ -77,8 +77,6 @@ def get_model(cfg: DictConfig):
                 for p in dit_model.parameters():
                     p.requires_grad = False
                 dit_model = get_peft_model(dit_model, lora_config)
-                for p in dit_model.parameters():
-                    p.data = p.data.float()
                 action_head.model = dit_model
                 dit_model.model.state_encoder.requires_grad_(True)
                 dit_model.model.action_encoder.requires_grad_(True)

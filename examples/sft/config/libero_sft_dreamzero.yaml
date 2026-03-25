@@ -12,7 +12,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 4-5
+    actor,env,rollout: 6-7
 
 runner:
   task_type: sft
