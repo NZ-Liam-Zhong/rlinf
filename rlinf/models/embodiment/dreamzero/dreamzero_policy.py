@@ -345,14 +345,30 @@ class DreamZeroPolicy(nn.Module, BasePolicy):
         config_dict.update(rewritten)
 
     def _load_model_with_config(self, model_path: str, config) -> "VLA":
-        """Load VLA with custom config (e.g. IdentityBackbone) and weights."""
-        from safetensors.torch import load_file
+        """Load VLA with custom config (e.g. IdentityBackbone).
 
+        If model safetensors are present, load them.
+        If not, keep config-initialized weights and rely on WANPolicyHead
+        component loading paths from config (Wan base training mode).
+        """
         from groot.vla.model.dreamzero.base_vla import VLA
 
-        state_dict = {}
         safetensors_path = Path(model_path) / "model.safetensors"
         safetensors_index_path = Path(model_path) / "model.safetensors.index.json"
+        has_weights = safetensors_index_path.exists() or safetensors_path.exists()
+
+        model = VLA(config)
+
+        if not has_weights:
+            logger.info(
+                "No model safetensors found at %s; initialized from config only.",
+                model_path,
+            )
+            return model
+
+        from safetensors.torch import load_file
+
+        state_dict = {}
 
         if safetensors_index_path.exists():
             with open(safetensors_index_path) as f:
@@ -362,15 +378,10 @@ class DreamZeroPolicy(nn.Module, BasePolicy):
                 state_dict.update(load_file(str(shard_path)))
         elif safetensors_path.exists():
             state_dict.update(load_file(str(safetensors_path)))
-        else:
-            raise FileNotFoundError(f"No weights at {model_path}")
-
-        model = VLA(config)
 
         has_base_layer = any(".base_layer." in k for k in state_dict)
         if has_base_layer:
             state_dict = {k.replace(".base_layer.", "."): v for k, v in state_dict.items()}
-
         model.load_state_dict(state_dict, strict=False)
         return model
 

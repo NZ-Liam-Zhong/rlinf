@@ -12,15 +12,24 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+LIBERO_PROMPT_TEMPLATE = (
+    "As a robot, perform the manipulation task: {task}. "
+    "Observe the scene from both a third-person and wrist camera view."
+)
+
 
 class DreamZeroLiberoDataset(Dataset):
     """Map LeRobot v3 LIBERO samples to DreamZero training inputs."""
 
+    VIDEO_CHUNK_OFFSETS = [0, 2, 4, 6, 8, 10, 12, 14]
+    VIDEO_CHUNK_STRIDE = 16
+    ACTION_CHUNK_SIZE = 16
+
     def __init__(
         self,
         data_path: str | list[str],
-        action_horizon: int = 24,
-        video_horizon: int = 33,
+        action_horizon: int = 64,
+        num_chunks: int = 4,
         max_action_dim: int = 32,
         max_state_dim: int = 64,
     ):
@@ -31,9 +40,11 @@ class DreamZeroLiberoDataset(Dataset):
                 raise ValueError("DreamZeroLiberoDataset requires at least one data path.")
             data_path = data_path[0]
         self.data_path = str(data_path)
+        self.num_chunks = num_chunks
         self.action_horizon = action_horizon
-        self.video_horizon = video_horizon
-        self.state_horizon = max(1, (video_horizon - 1) // 8)
+        self.video_frames_per_chunk = len(self.VIDEO_CHUNK_OFFSETS)
+        self.video_horizon = self.video_frames_per_chunk * num_chunks + 1
+        self.state_horizon = num_chunks
         self.max_action_dim = max_action_dim
         self.max_state_dim = max_state_dim
         self.embodiment_id = 17
@@ -41,12 +52,21 @@ class DreamZeroLiberoDataset(Dataset):
         metadata = lerobot_dataset.LeRobotDatasetMetadata(self.data_path)
         self._fps = metadata.fps
         self._tasks = self._load_task_texts(Path(self.data_path) / "meta")
-        state_delta_steps = [i * 8 for i in range(self.state_horizon)]
+
+        video_steps: list[int] = []
+        for c in range(num_chunks):
+            base = c * self.VIDEO_CHUNK_STRIDE
+            video_steps.extend(base + o for o in self.VIDEO_CHUNK_OFFSETS)
+        video_steps.append(video_steps[-1] + 2)
+
+        state_steps = [c * self.VIDEO_CHUNK_STRIDE for c in range(num_chunks)]
+        action_steps = list(range(action_horizon))
+
         delta_timestamps = {
-            "observation.images.image": [t / self._fps for t in range(self.video_horizon)],
-            "observation.images.wrist_image": [t / self._fps for t in range(self.video_horizon)],
-            "observation.state": [t / self._fps for t in state_delta_steps],
-            "action": [t / self._fps for t in range(self.action_horizon)],
+            "observation.images.image": [t / self._fps for t in video_steps],
+            "observation.images.wrist_image": [t / self._fps for t in video_steps],
+            "observation.state": [t / self._fps for t in state_steps],
+            "action": [t / self._fps for t in action_steps],
         }
         self.dataset = lerobot_dataset.LeRobotDataset(
             self.data_path,
@@ -79,8 +99,6 @@ class DreamZeroLiberoDataset(Dataset):
 
         tasks_df = pd.read_parquet(task_path)
 
-        # LeRobot v3 convention: task text is the DataFrame *index*,
-        # and `task_index` is the only column.  Detect this layout first.
         if (
             list(tasks_df.columns) == ["task_index"]
             and tasks_df.index.dtype.kind in ("U", "O", "S")
@@ -89,7 +107,6 @@ class DreamZeroLiberoDataset(Dataset):
                 task_map[int(row["task_index"])] = str(text)
             return task_map
 
-        # Fallback: look for an explicit text column.
         text_col = None
         for candidate in ("task", "task_text", "language", "instruction", "prompt"):
             if candidate in tasks_df.columns:
@@ -119,15 +136,12 @@ class DreamZeroLiberoDataset(Dataset):
         return arr
 
     def _build_video_grid(self, main_frames: np.ndarray, wrist_frames: np.ndarray) -> np.ndarray:
+        """Horizontally concatenate main and wrist views: (T, 256, 256, 3) × 2 → (T, 256, 512, 3)."""
         images = []
         for idx in range(main_frames.shape[0]):
             main = self._to_hwc_uint8(main_frames[idx])
             wrist = self._to_hwc_uint8(wrist_frames[idx])
-            # Keep Libero resolution at 256x256 to avoid VAE OOM/cudnn init failures.
-            # A simple average preserves both camera signals in a single frame.
-            merged = ((main.astype(np.float32) + wrist.astype(np.float32)) * 0.5).astype(
-                np.uint8
-            )
+            merged = np.concatenate([main, wrist], axis=1)
             images.append(merged)
         return np.stack(images, axis=0)
 
@@ -193,11 +207,6 @@ class DreamZeroLiberoDataset(Dataset):
             "lapa_action": np.zeros_like(action_pad),
             "lapa_action_mask": np.zeros_like(action_mask),
             "text": prompt,
-            "text_negative": (
-                "Vibrant colors, overexposed, static, blurry details, text, subtitles, "
-                "style, artwork, painting, image, still, grayscale, dull, worst quality, "
-                "low quality, JPEG artifacts, ugly."
-            ),
         }
 
 
@@ -224,18 +233,13 @@ class DreamZeroCollator:
             values = [f[key] for f in features]
             batch[key] = torch.as_tensor(np.stack(values, axis=0))
 
-        text_values = [str(f["text"]) for f in features]
+        raw_texts = [str(f["text"]) for f in features]
+        text_values = [LIBERO_PROMPT_TEMPLATE.format(task=t) for t in raw_texts]
         text_ids, text_mask = self.tokenizer(
             text_values, return_mask=True, add_special_tokens=True
         )
-        neg_values = [str(f["text_negative"]) for f in features]
-        neg_ids, neg_mask = self.tokenizer(
-            neg_values, return_mask=True, add_special_tokens=True
-        )
         batch["text"] = torch.as_tensor(text_ids)
         batch["text_attention_mask"] = torch.as_tensor(text_mask)
-        batch["text_negative"] = torch.as_tensor(neg_ids)
-        batch["text_attention_mask_negative"] = torch.as_tensor(neg_mask)
         return batch
 
 
@@ -250,19 +254,16 @@ def build_dreamzero_sft_dataloader(
     model_cfg = cfg.actor.model
     tokenizer_path = model_cfg.get("tokenizer_path", "google/umt5-xxl")
     max_seq_len = int(model_cfg.get("max_seq_len", 512))
-    action_horizon = int(model_cfg.get("dreamzero_action_horizon", 24))
-    video_horizon = int(model_cfg.get("dreamzero_video_horizon", 33))
-    # DreamZero training stacks multiple action chunks for long video windows.
-    # For the common 33-frame setting this expands 48 -> 192.
-    action_chunk_multiplier = max(1, video_horizon // 8)
-    effective_action_horizon = action_horizon * action_chunk_multiplier
-    max_action_dim = int(model_cfg.get("dreamzero_max_action_dim", 64))
+    action_chunk_size = int(model_cfg.get("dreamzero_action_horizon", 16))
+    num_chunks = int(model_cfg.get("dreamzero_num_chunks", 4))
+    effective_action_horizon = action_chunk_size * num_chunks
+    max_action_dim = int(model_cfg.get("dreamzero_max_action_dim", 32))
     max_state_dim = int(model_cfg.get("dreamzero_max_state_dim", 64))
 
     dataset = DreamZeroLiberoDataset(
         data_path=data_paths,
         action_horizon=effective_action_horizon,
-        video_horizon=video_horizon,
+        num_chunks=num_chunks,
         max_action_dim=max_action_dim,
         max_state_dim=max_state_dim,
     )
